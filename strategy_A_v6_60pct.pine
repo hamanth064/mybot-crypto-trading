@@ -1,0 +1,214 @@
+//@version=6
+// Strategy A v6 — 60% Accuracy Target
+// BTC/USDT — 4H chart
+// Upgrades from v5:
+//   1. Min score raised 3/5 → 4/5 (only best setups)
+//   2. ADX filter — only trade strong trends (ADX > 25)
+//   3. Higher timeframe filter — daily EMA must agree
+//   4. Candle confirmation — hammer / engulfing pattern
+//   5. Risk:reward raised 1:2 → 1:2.5
+//   6. Partial take profit — close 50% at 1:1.5, rest at 1:2.5
+//   7. Cooldown raised 3 → 5 bars
+
+strategy("Strategy A v6 — 60% Accuracy",
+     overlay           = true,
+     initial_capital   = 100,
+     currency          = currency.USDT,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 20,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.1,
+     max_bars_back     = 500)
+
+// ─── SETTINGS ────────────────────────────────────────────────────────────────
+grp1 = "Signal settings"
+rsiLen        = input.int  (14,   "RSI length",             minval=5,  maxval=30,            group=grp1)
+rsiOversold   = input.int  (45,   "RSI oversold",           minval=30, maxval=55,            group=grp1)
+rsiOverbought = input.int  (58,   "RSI overbought",         minval=52, maxval=75,            group=grp1)
+macdFast      = input.int  (8,    "MACD fast",              minval=4,  maxval=20,            group=grp1)
+macdSlow      = input.int  (21,   "MACD slow",              minval=10, maxval=40,            group=grp1)
+macdSig       = input.int  (5,    "MACD signal",            minval=3,  maxval=15,            group=grp1)
+bbLen         = input.int  (20,   "BB length",              minval=10, maxval=50,            group=grp1)
+bbMult        = input.float(2.0,  "BB multiplier",          minval=1.0,maxval=3.0, step=0.1, group=grp1)
+stFactor      = input.float(2.0,  "Supertrend factor",      minval=1.0,maxval=5.0, step=0.5, group=grp1)
+stLen         = input.int  (10,   "Supertrend ATR len",     minval=5,  maxval=20,            group=grp1)
+minScore      = input.int  (4,    "Min score — 4 of 5",     minval=3,  maxval=5,             group=grp1)
+adxLen        = input.int  (14,   "ADX length",             minval=5,  maxval=30,            group=grp1)
+adxThresh     = input.int  (25,   "ADX min strength",       minval=15, maxval=40,            group=grp1)
+
+grp2 = "Risk management"
+atrLen        = input.int  (14,   "ATR length",             minval=5,  maxval=30,            group=grp2)
+slMult        = input.float(1.0,  "Stop loss ATR mult",     minval=0.3,maxval=3.0, step=0.1, group=grp2)
+tp1Mult       = input.float(1.5,  "Take profit 1 ATR mult (50% close)", minval=0.5, maxval=3.0, step=0.5, group=grp2)
+tp2Mult       = input.float(2.5,  "Take profit 2 ATR mult (full close)", minval=1.5, maxval=6.0, step=0.5, group=grp2)
+cooldownBars  = input.int  (5,    "Cooldown bars",          minval=2,  maxval=20,            group=grp2)
+
+// ─── INDICATORS ───────────────────────────────────────────────────────────────
+
+// 1. RSI
+rsi         = ta.rsi(close, rsiLen)
+rsiOS       = rsi < rsiOversold
+rsiOB       = rsi > rsiOverbought
+
+// 2. MACD
+[macdLine, sigLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdBull    = macdLine > sigLine and macdHist > macdHist[1]
+macdBear    = macdLine < sigLine and macdHist < macdHist[1]
+
+// 3. Bollinger Bands
+bbBasis     = ta.sma(close, bbLen)
+bbDev       = ta.stdev(close, bbLen)
+bbLower     = bbBasis - bbMult * bbDev
+bbUpper     = bbBasis + bbMult * bbDev
+bbBuy       = close < bbBasis
+bbSell      = close > bbBasis
+
+// 4. EMA triple trend — 4H
+ema21       = ta.ema(close, 21)
+ema55       = ta.ema(close, 55)
+ema200      = ta.ema(close, 200)
+trendUp     = ema21 > ema55 and ema55 > ema200
+trendDown   = ema21 < ema55 and ema55 < ema200
+
+// 5. Supertrend
+[stLine, stDir] = ta.supertrend(stFactor, stLen)
+stBull      = stDir < 0
+stBear      = stDir > 0
+
+// 6. ADX — trend strength filter (NEW in v6)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trendStrong = adx > adxThresh
+
+// 7. Higher timeframe EMA filter — daily chart (NEW in v6)
+ema50D      = ta.ema(close, 50  * 6)   // approximate daily EMA on 4H chart
+ema200D     = ta.ema(close, 200 * 6)   // approximate daily EMA on 4H chart
+htfBull     = ema50D > ema200D         // daily trend is up
+htfBear     = ema50D < ema200D         // daily trend is down
+
+// 8. Candle confirmation (NEW in v6)
+bodySize    = math.abs(close - open)
+wickLow     = math.min(open, close) - low
+wickHigh    = high - math.max(open, close)
+// Hammer: small body, long lower wick — bounce signal
+isHammer    = wickLow > bodySize * 1.5 and close > open
+// Bullish engulfing: current candle fully engulfs previous candle
+isEngulfing = close > open and open < close[1] and close > open[1]
+// Bearish engulfing: opposite
+isBearEngulf = close < open and open > close[1] and close < open[1]
+candleBull  = isHammer or isEngulfing
+candleBear  = isBearEngulf
+
+// ATR
+atr         = ta.atr(atrLen)
+
+// ─── SCORING SYSTEM ───────────────────────────────────────────────────────────
+buyScore  = (rsiOS    ? 1 : 0) + (macdBull ? 1 : 0) + (bbBuy    ? 1 : 0) + (trendUp   ? 1 : 0) + (stBull ? 1 : 0)
+sellScore = (rsiOB    ? 1 : 0) + (macdBear ? 1 : 0) + (bbSell   ? 1 : 0) + (trendDown ? 1 : 0) + (stBear ? 1 : 0)
+
+// ─── ENTRY CONDITIONS — ALL extra filters must pass ───────────────────────────
+var int lastBar = 0
+coolOk    = (bar_index - lastBar) >= cooldownBars
+inPos     = strategy.position_size > 0
+
+strongBuy =
+     buyScore  >= minScore and   // 4 of 5 signals agree
+     trendStrong            and   // ADX confirms strong trend
+     htfBull                and   // daily chart is bullish
+     candleBull             and   // candle pattern confirms
+     not trendDown          and   // not in downtrend
+     coolOk
+
+strongSell =
+     sellScore >= minScore  and
+     (htfBear or trendDown) and
+     candleBear             and
+     inPos
+
+// ─── RISK MANAGEMENT — partial TP ────────────────────────────────────────────
+var float sl    = 0.0
+var float tp1   = 0.0
+var float tp2   = 0.0
+var float trHi  = 0.0
+var bool  tp1Hit = false
+
+if strongBuy and not inPos
+    sl      := close - atr * slMult
+    tp1     := close + atr * tp1Mult
+    tp2     := close + atr * tp2Mult
+    trHi    := close
+    tp1Hit  := false
+    strategy.entry("Long", strategy.long, comment="BUY " + str.tostring(buyScore) + "/5")
+    lastBar := bar_index
+
+if inPos
+    trHi := math.max(trHi, close)
+
+trailSL = inPos ? trHi - atr * slMult : na
+
+if inPos and not tp1Hit and close >= tp1
+    strategy.close("Long", qty_percent=50, comment="TP1 50%")
+    tp1Hit  := true
+
+if inPos
+    if close >= tp2
+        strategy.close("Long", comment="TP2 FULL")
+        lastBar := bar_index
+    else if close <= math.max(sl, nz(trailSL, 0))
+        strategy.close("Long", comment="STOP/TRAIL")
+        lastBar := bar_index
+    else if strongSell
+        strategy.close("Long", comment="SIGNAL EXIT")
+        lastBar := bar_index
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(ema21,   "EMA21",   color=color.new(color.yellow, 40), linewidth=1)
+plot(ema55,   "EMA55",   color=color.new(color.orange, 40), linewidth=1)
+plot(ema200,  "EMA200",  color=color.new(color.red,    40), linewidth=2)
+plot(bbUpper, "BBU",     color=color.new(color.blue,   60), linewidth=1)
+plot(bbLower, "BBL",     color=color.new(color.blue,   60), linewidth=1)
+plot(stLine,  "ST",      color=stBull ? color.new(color.green,30) : color.new(color.red,30), linewidth=2)
+
+plot(inPos ? sl      : na, "SL",     color=color.new(color.red,    0), linewidth=1, style=plot.style_linebr)
+plot(inPos ? tp1     : na, "TP1",    color=color.new(color.yellow, 0), linewidth=1, style=plot.style_linebr)
+plot(inPos ? tp2     : na, "TP2",    color=color.new(color.green,  0), linewidth=1, style=plot.style_linebr)
+plot(inPos ? trailSL : na, "Trail",  color=color.new(color.orange, 0), linewidth=1, style=plot.style_linebr)
+
+plotshape(strongBuy  and not inPos, location=location.belowbar, style=shape.triangleup,   color=color.green, size=size.normal, title="Buy")
+plotshape(strongSell,               location=location.abovebar, style=shape.triangledown, color=color.red,   size=size.normal, title="Sell")
+plotshape(isHammer,    location=location.belowbar, style=shape.labelup,   color=color.new(color.green,50), text="H",  size=size.tiny, title="Hammer")
+plotshape(isEngulfing, location=location.belowbar, style=shape.labelup,   color=color.new(color.green,50), text="E",  size=size.tiny, title="Engulfing")
+
+bgCol = buyScore >= 4 and trendStrong and htfBull ? color.new(color.green, 88) : sellScore >= 4 and htfBear ? color.new(color.red, 88) : na
+bgcolor(bgCol)
+
+// ─── TABLE ───────────────────────────────────────────────────────────────────
+var table tb = table.new(position.top_right, 2, 13, bgcolor=color.new(color.black,72), border_width=1)
+sc(s) => s >= 4 ? color.green : s == 3 ? color.yellow : color.red
+
+if barstate.islast
+    table.cell(tb,0,0,  "Strategy A v6",     text_color=color.white, bgcolor=color.new(color.teal,40),  text_size=size.small)
+    table.cell(tb,1,0,  "60% Target",        text_color=color.white, bgcolor=color.new(color.teal,40),  text_size=size.small)
+    table.cell(tb,0,1,  "Buy score",         text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,1,  str.tostring(buyScore)+"/5",  text_color=sc(buyScore),  text_size=size.small)
+    table.cell(tb,0,2,  "RSI",               text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,2,  str.tostring(math.round(rsi,1)), text_color=rsiOS?color.green:rsiOB?color.red:color.white, text_size=size.small)
+    table.cell(tb,0,3,  "MACD",              text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,3,  macdBull?"BULL":"BEAR", text_color=macdBull?color.green:color.red, text_size=size.small)
+    table.cell(tb,0,4,  "Supertrend",        text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,4,  stBull?"BULL":"BEAR",   text_color=stBull?color.green:color.red,   text_size=size.small)
+    table.cell(tb,0,5,  "ADX strength",      text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,5,  str.tostring(math.round(adx,1)) + (trendStrong?" STRONG":" weak"), text_color=trendStrong?color.green:color.red, text_size=size.small)
+    table.cell(tb,0,6,  "Daily trend",       text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,6,  htfBull?"BULL":"BEAR",  text_color=htfBull?color.green:color.red,  text_size=size.small)
+    table.cell(tb,0,7,  "Candle",            text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,7,  candleBull?"BULL PATTERN":"neutral", text_color=candleBull?color.green:color.white, text_size=size.small)
+    table.cell(tb,0,8,  "4H Trend",          text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,8,  trendUp?"UP":trendDown?"DOWN":"MIXED", text_color=trendUp?color.green:trendDown?color.red:color.yellow, text_size=size.small)
+    table.cell(tb,0,9,  "Stop",              text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,9,  inPos?"$"+str.tostring(math.round(sl,0)):"—",  text_color=color.red,    text_size=size.small)
+    table.cell(tb,0,10, "TP1 (50%)",         text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,10, inPos?"$"+str.tostring(math.round(tp1,0)):"—", text_color=color.yellow, text_size=size.small)
+    table.cell(tb,0,11, "TP2 (full)",        text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,11, inPos?"$"+str.tostring(math.round(tp2,0)):"—", text_color=color.green,  text_size=size.small)
+    table.cell(tb,0,12, "Total trades",      text_color=color.gray,  text_size=size.small)
+    table.cell(tb,1,12, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
